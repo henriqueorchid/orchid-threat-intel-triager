@@ -1,0 +1,5 @@
+[2026-11-10 12:10:04] FW-DROP SRC=161.118.214.16 DST=10.0.0.15 PROTO=TCP DPT=443
+[2026-11-10 12:11:19] DNS-QUERY client=10.0.0.42 query=word-template.net action=flagged
+[2026-11-10 12:12:02] EDR-ALERT host=WKST-09 file=payload.exe sha256=1941cbf3b6e705550f373990b5702220b2c1db0dceaf252ded42cdaff295c54f
+[2026-11-10 12:14:55] PROXY-ALLOW dst_ip=8.8.8.8 
+url=eng-polymarket.com
