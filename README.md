@@ -2,7 +2,7 @@
 
 # Orchid Threat Intel Triager
 
-Ferramenta de linha de comando para triagem e enriquecimento de Indicadores de Comprometimento (IoCs) em múltiplas fontes de Threat Intelligence simultaneamente. Recebe um indicador único (IP, hash, domínio ou URL) ou um arquivo de log bruto (`.txt`/`.csv`), descarta ruído interno antes de tocar na rede, consulta até 5 APIs em paralelo e devolve um veredito consolidado com score de severidade e estimativa de falso-positivo.
+CLI de triagem e enriquecimento de Indicadores de Comprometimento (IoCs) em múltiplas fontes de Threat Intelligence. Desenvolvi esta ferramenta para agilizar a triagem no dia a dia de SOC direto pelo terminal — sem precisar abrir e alternar entre várias abas de portais para cada alerta. Ela aceita um indicador único (IP, hash, domínio ou URL) ou um arquivo de log bruto (`.txt`/`.csv`), descarta ruído interno antes de fazer qualquer requisição externa, consulta até 5 APIs em paralelo e entrega um veredito consolidado com score de severidade e estimativa de falso-positivo.
 
 ---
 
@@ -23,7 +23,7 @@ O **Orchid Threat Intel Triager** automatiza essa correlação no terminal:
 O projeto separa explicitamente camada de apresentação, extração, motor de decisão e conectores externos:
 
 ```text
-meu-ti-enricher/
+orchid-threat-intel-triager/
 ├── main.py                  # CLI ANSI (paleta Orchid), menus interativos, cadência de lote e exibição
 ├── core/
 │   ├── extractor.py         # Leitura resiliente (.txt/.csv UTF-8/Latin-1), Regex e filtro ipaddress
@@ -37,16 +37,18 @@ meu-ti-enricher/
 ├── docs/images/             # Capturas de tela da CLI
 ├── .env.example             # Modelo de variáveis de ambiente para as chaves de API
 ├── requirements.txt         # Dependências Python
+├── README.md                # Documentação em português
+├── README.en.md             # Documentação em inglês
 └── LICENSE                  # Licença MIT
 ```
 
 ### Contrato dos conectores (`integrations/`)
 
-Todos os módulos de integração devolvem um dicionário padronizado com `"source"` e seguem a mesma convenção de estado:
+Todos os módulos de integração devolvem um dicionário padronizado com a identificação da fonte e seguem a mesma convenção de estado:
 - **Sucesso (`200`)**: campos normalizados da fonte.
-- **Rate limit / Cota (`429` ou `403`)**: `{"source": ..., "rate_limited": True, "aviso": ...}` — removido do denominador de pesos sem derrubar a análise.
-- **Sem registro ou indicador inválido (`404`, `422` ou `400`)**: `{"source": ..., "aviso": ...}` — tratado graciosamente como ausência de histórico/indicador não roteável.
-- **Credencial inválida ou erro de rede (`401`, timeout, `RequestException`)**: `{"source": ..., "erro": ...}`.
+- **Rate limit / Cota (`429` ou `403`)**: sinaliza limite de cota e sai do denominador de pesos sem interromper a análise.
+- **Sem registro ou indicador inválido (`404`, `422` ou `400`)**: retorna aviso informativo sem interromper o fluxo ou poluir o relatório com erro crítico.
+- **Credencial inválida ou erro de rede (`401`, timeout, falha de conexão)**: retorna erro isolado daquela fonte, permitindo que as demais continuem.
 
 ---
 
@@ -62,9 +64,9 @@ Cada indicador é roteado apenas para as fontes compatíveis e pontuado de `0` a
 | **Hash (MD5 / SHA-256)** | `0.75` | — | — | `0.25` | — |
 | **Domínio / URL** | `0.40` | — | — | `0.20` | `0.40` |
 
-- **Renormalização dinâmica**: quando alguma API está em *rate limit* ou falha de conexão, ela sai da soma ativa (`soma_pesos_ativos`) e as fontes restantes mantêm o cálculo proporcional.
-- **Ajuste para URLScan sem histórico**: se o URLScan.io retornar `"aviso"` (nenhuma varredura prévia), seu peso cai para `25%` do valor original (`peso * 0.25`) para não diluir ameaças confirmadas por VirusTotal ou AbuseIPDB.
-- **Bônus de convergência e sinergia**: `>= 3` fontes maliciosas somam `+12.0` na severidade; atribuição de Threat Actor/APT no OTX soma `+10.0`; convergência forte entre AbuseIPDB e GreyNoise (`>= 80`) soma `+15.0`.
+- **Renormalização dinâmica**: quando alguma API está em *rate limit* ou falha de conexão, ela sai do cálculo ativo e os pesos das fontes restantes são reajustados proporcionalmente.
+- **Ajuste para URLScan sem histórico**: se o URLScan.io não tiver varreduras prévias do indicador, seu peso é reduzido na média para não diluir ameaças confirmadas por VirusTotal ou AbuseIPDB.
+- **Reforço por consenso entre fontes**: quando 3 ou mais fontes apontam risco, há atribuição de Threat Actor/APT no OTX ou forte concordância entre AbuseIPDB e GreyNoise, a severidade recebe reforço adicional.
 
 ### 2. Faixas de severidade
 
@@ -78,23 +80,19 @@ Cada indicador é roteado apenas para as fontes compatíveis e pontuado de `0` a
 
 ### 3. Estimativa de Falso-Positivo (0% a 100%)
 
-Quando nenhuma fonte aponta risco, o falso-positivo fica em `N/A (Sem detecções maliciosas)`. Havendo qualquer detecção, o cálculo parte de uma base neutra de `50%` e aplica evidências conflitantes ou confirmatórias:
+Quando nenhuma fonte aponta risco, o falso-positivo fica marcado como `N/A (Sem detecções maliciosas)`. Havendo qualquer detecção, o motor parte de uma linha de base neutra e pondera evidências conflitantes contra confirmações independentes:
 
 - **Sinais que elevam a chance de falso-positivo (e atenuam a severidade):**
-  - GreyNoise `riot: True` (infraestrutura legítima conhecida, ex.: DNS público, cloud provider): `+45%` no FP e severidade multiplicada por `0.25`.
-  - GreyNoise `classification == "benign"`: `+35%` no FP e severidade `× 0.45`.
-  - Whitelist oficial do AbuseIPDB (`+35%` FP, severidade `× 0.40`) ou validação/whitelist no AlienVault OTX (`+30%` FP, severidade `× 0.50`).
-  - Detecção marginal no VirusTotal (`1` a `2` motores maliciosos contra `>= 40` motores *harmless*): `+30%` no FP.
-  - Reputação comunitária positiva no VirusTotal (`reputation > 5`): `+25%` no FP e severidade `× 0.60`.
-  - Alerta isolado apenas no AlienVault OTX com `>= 2` fontes consultadas: `+28%` no FP.
-  - Hospedagem em provedor de CDN/Nuvem compartilhada (Cloudflare, Akamai, Fastly, AWS, Google, Azure, Incapsula) com severidade `< 75`: `+15%` no FP.
+  - IP classificado no GreyNoise RIOT (infraestrutura legítima conhecida, como DNS público ou provedores cloud) ou marcado como scanner benigno.
+  - Presença nas whitelists oficiais do AbuseIPDB ou do AlienVault OTX.
+  - Detecção marginal no VirusTotal (apenas 1 ou 2 motores sinalizando contra dezenas de motores limpos) ou reputação comunitária positiva.
+  - Alerta restrito a pulses comunitários do OTX sem confirmação nos motores primários, ou hospedagem em CDN/nuvem compartilhada com severidade moderada.
 
 - **Sinais que reduzem a chance de falso-positivo:**
-  - Volume alto de detecções no VirusTotal (`>= 15`: `-42%`; `>= 6`: `-25%`; `>= 3`: `-10%`) e reputação negativa (`<= -10`: `-20%`).
-  - Consenso no AbuseIPDB (`score >= 80` com `>= 10` redes distintas reportando): `-30%`.
-  - GreyNoise `classification == "malicious"`: `-30%`.
-  - Sandbox do URLScan.io confirmando `malicious: True`: `-30%`.
-  - Convergência de `>= 3` fontes (`-25%`) ou `2` fontes (`-15%`).
+  - Amplo consenso de motores no VirusTotal e reputação comunitária negativa.
+  - Alto volume de denúncias distribuídas por múltiplas redes distintas no AbuseIPDB.
+  - Atividade maliciosa confirmada pelos sensores do GreyNoise ou veredito malicioso na sandbox do URLScan.io.
+  - Concordância simultânea entre duas ou mais fontes independentes.
 
 ---
 

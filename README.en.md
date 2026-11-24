@@ -2,7 +2,7 @@
 
 # Orchid Threat Intel Triager
 
-A CLI tool for triaging and enriching Indicators of Compromise (IoCs) across multiple Threat Intelligence providers in parallel. It accepts either a single indicator (IP, hash, domain, or URL) or a raw log file (`.txt`/`.csv`), strips internal noise before making any outbound request, queries up to 5 APIs concurrently, and outputs a consolidated verdict with a severity score and false-positive estimate.
+A CLI tool for triaging and enriching Indicators of Compromise (IoCs) across multiple Threat Intelligence providers. I built this to speed up daily SOC triage straight from the terminal—without opening and tab-hopping across half a dozen threat intel portals for every alert. It accepts a single indicator (IP, hash, domain, or URL) or a raw log file (`.txt`/`.csv`), drops internal noise before making any outbound request, queries up to 5 APIs in parallel, and outputs a consolidated verdict with a severity score and false-positive estimate.
 
 ---
 
@@ -23,7 +23,7 @@ During Tier-1/Tier-2 SOC triage, validating alerts usually means tab-hopping acr
 The codebase strictly separates CLI presentation, IoC extraction, scoring/consensus, and API connectors:
 
 ```text
-meu-ti-enricher/
+orchid-threat-intel-triager/
 ├── main.py                  # ANSI CLI (Orchid palette), interactive menus, batch cadence, and reports
 ├── core/
 │   ├── extractor.py         # Resilient log reader (.txt/.csv UTF-8/Latin-1), Regex, and ipaddress filter
@@ -37,16 +37,18 @@ meu-ti-enricher/
 ├── docs/images/             # CLI screenshots
 ├── .env.example             # Environment variable template for API keys
 ├── requirements.txt         # Python dependencies
+├── README.md                # Portuguese documentation
+├── README.en.md             # English documentation
 └── LICENSE                  # MIT License
 ```
 
 ### Connector return contract (`integrations/`)
 
-Every connector returns a standardized dictionary containing `"source"` and follows a single state contract:
+Every connector returns a standardized dictionary identifying its source and follows a single state contract:
 - **Success (`200`)**: normalized telemetry fields from that provider.
-- **Rate limit / Quota (`429` or `403`)**: `{"source": ..., "rate_limited": True, "aviso": ...}` — excluded from weight calculation without aborting the run.
-- **No record or invalid/non-routable indicator (`404`, `422`, or `400`)**: `{"source": ..., "aviso": ...}` — handled gracefully as uncatalogued or non-routable.
-- **Invalid credentials or network failure (`401`, timeout, `RequestException`)**: `{"source": ..., "erro": ...}`.
+- **Rate limit / Quota (`429` or `403`)**: flags the quota limit and removes the provider from the weight denominator without aborting the run.
+- **No record or invalid/non-routable indicator (`404`, `422`, or `400`)**: returns an informational notice without interrupting the pipeline or cluttering the report with critical errors.
+- **Invalid credentials or network failure (`401`, timeout, connection error)**: returns an isolated source error while the remaining APIs complete the lookup.
 
 ---
 
@@ -62,9 +64,9 @@ Each indicator is routed only to compatible providers and scored from `0` to `10
 | **Hash (MD5 / SHA-256)** | `0.75` | — | — | `0.25` | — |
 | **Domain / URL** | `0.40` | — | — | `0.20` | `0.40` |
 
-- **Dynamic renormalization**: if an API hits a rate limit or network error, it is omitted from `soma_pesos_ativos` and the weighted average is computed over the providers that responded.
-- **URLScan no-history dampening**: when URLScan.io returns `"aviso"` (no prior scan history), its weight is scaled to `25%` (`weight * 0.25`) so a lack of web scans does not dilute threats confirmed by VirusTotal or AbuseIPDB.
-- **Convergence and synergy boosts**: `>= 3` malicious sources add `+12.0` to severity; OTX Threat Actor/APT attribution adds `+10.0`; strong convergence between AbuseIPDB and GreyNoise (`>= 80`) adds `+15.0`.
+- **Dynamic renormalization**: if an API hits a rate limit or network error, it is omitted from the active calculation and the remaining weights are rebalanced proportionally.
+- **URLScan no-history dampening**: when URLScan.io has no prior scan history for an indicator, its weight is scaled down so a lack of web scans does not dilute threats confirmed by VirusTotal or AbuseIPDB.
+- **Multi-source corroboration boosts**: when 3 or more sources flag an indicator, OTX links it to a Threat Actor/APT, or AbuseIPDB and GreyNoise strongly agree, severity receives an additional boost.
 
 ### 2. Severity tiers
 
@@ -78,23 +80,19 @@ Each indicator is routed only to compatible providers and scored from `0` to `10
 
 ### 3. False-positive probability (0% to 100%)
 
-When no provider detects malicious activity, false-positive status is `N/A`. Once any detection is present, the engine starts at a neutral `50%` baseline and adjusts for conflicting or corroborating evidence:
+When no provider detects malicious activity, false-positive status stays at `N/A`. Once any detection is present, the engine starts from a neutral baseline and balances conflicting benign evidence against independent threat confirmations:
 
 - **Signals increasing false-positive likelihood (and dampening severity):**
-  - GreyNoise `riot: True` (known legitimate infrastructure such as public DNS or cloud services): `+45%` FP, severity `× 0.25`.
-  - GreyNoise `classification == "benign"`: `+35%` FP, severity `× 0.45`.
-  - Official AbuseIPDB whitelist (`+35%` FP, severity `× 0.40`) or AlienVault OTX validation/whitelist (`+30%` FP, severity `× 0.50`).
-  - Marginal VirusTotal detection (`1–2` malicious engines vs `>= 40` harmless): `+30%` FP.
-  - Positive VirusTotal community reputation (`reputation > 5`): `+25%` FP, severity `× 0.60`.
-  - Alert isolated to AlienVault OTX community pulses with `>= 2` queried providers: `+28%` FP.
-  - Shared CDN/Cloud hosting (Cloudflare, Akamai, Fastly, AWS, Google, Azure, Incapsula) when severity `< 75`: `+15%` FP.
+  - IP listed in GreyNoise RIOT (known legitimate infrastructure such as public DNS or cloud providers) or classified as a benign scanner.
+  - Presence on official AbuseIPDB or AlienVault OTX whitelists.
+  - Marginal VirusTotal detection (only 1 or 2 flagging engines against dozens of clean ones) or positive community reputation.
+  - Alert isolated to OTX community pulses with no confirmation from primary engines, or hosting on shared CDN/cloud infrastructure at moderate severity.
 
 - **Signals reducing false-positive likelihood:**
-  - Broad VirusTotal engine consensus (`>= 15`: `-42%`; `>= 6`: `-25%`; `>= 3`: `-10%`) and negative community reputation (`<= -10`: `-20%`).
-  - AbuseIPDB multi-network consensus (`score >= 80` across `>= 10` distinct reporting networks): `-30%`.
-  - GreyNoise `classification == "malicious"`: `-30%`.
-  - URLScan.io sandbox verdict `malicious: True`: `-30%`.
-  - Multi-source agreement (`>= 3` sources: `-25%`; `2` sources: `-15%`).
+  - Broad VirusTotal engine consensus and negative community reputation.
+  - High volume of AbuseIPDB reports spread across multiple distinct networks.
+  - Malicious activity confirmed by GreyNoise sensors or a malicious URLScan.io sandbox verdict.
+  - Simultaneous agreement across two or more independent providers.
 
 ---
 
